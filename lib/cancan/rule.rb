@@ -11,11 +11,13 @@ module CanCan
     # and subject respectively (such as :read, @project). The third argument is a hash
     # of conditions and the last one is the block passed to the "can" call.
     def initialize(base_behavior, action, subject, conditions, block)
-      raise Error, "You are not able to supply a block with a hash of conditions in #{action} #{subject} ability. Use either one." if conditions.kind_of?(Hash) && !block.nil?
+      both_block_and_hash_error = 'You are not able to supply a block with a hash of conditions in '\
+                                  "#{action} #{subject} ability. Use either one."
+      raise Error, both_block_and_hash_error if conditions.is_a?(Hash) && block
       @match_all = action.nil? && subject.nil?
       @base_behavior = base_behavior
-      @actions = [action].flatten
-      @subjects = [subject].flatten
+      @actions = Array(action)
+      @subjects = Array(subject)
       @conditions = conditions || {}
       @block = block
     end
@@ -32,22 +34,22 @@ module CanCan
         call_block_with_all(action, subject, extra_args)
       elsif @block && !subject_class?(subject)
         @block.call(subject, *extra_args)
-      elsif @conditions.kind_of?(Hash) && subject.class == Hash
+      elsif @conditions.is_a?(Hash) && subject.class == Hash
         nested_subject_matches_conditions?(subject)
-      elsif @conditions.kind_of?(Hash) && !subject_class?(subject)
+      elsif @conditions.is_a?(Hash) && !subject_class?(subject)
         matches_conditions_hash?(subject)
       else
         # Don't stop at "cannot" definitions when there are conditions.
-        @conditions.empty? ? true : @base_behavior
+        conditions_empty? ? true : @base_behavior
       end
     end
 
     def only_block?
-      conditions_empty? && !@block.nil?
+      conditions_empty? && @block
     end
 
     def only_raw_sql?
-      @block.nil? && !conditions_empty? && !@conditions.kind_of?(Hash)
+      @block.nil? && !conditions_empty? && !@conditions.is_a?(Hash)
     end
 
     def conditions_empty?
@@ -56,29 +58,33 @@ module CanCan
 
     def unmergeable?
       @conditions.respond_to?(:keys) && @conditions.present? &&
-        (!@conditions.keys.first.kind_of? Symbol)
+        (!@conditions.keys.first.is_a? Symbol)
     end
 
     def associations_hash(conditions = @conditions)
       hash = {}
-      conditions.map do |name, value|
-        hash[name] = associations_hash(value) if value.kind_of? Hash
-      end if conditions.kind_of? Hash
+      if conditions.is_a? Hash
+        conditions.map do |name, value|
+          hash[name] = associations_hash(value) if value.is_a? Hash
+        end
+      end
       hash
     end
 
     def attributes_from_conditions
       attributes = {}
-      @conditions.each do |key, value|
-        attributes[key] = value unless [Array, Range, Hash].include? value.class
-      end if @conditions.kind_of? Hash
+      if @conditions.is_a? Hash
+        @conditions.each do |key, value|
+          attributes[key] = value unless [Array, Range, Hash].include? value.class
+        end
+      end
       attributes
     end
 
     private
 
     def subject_class?(subject)
-      klass = (subject.kind_of?(Hash) ? subject.values.first : subject).class
+      klass = (subject.is_a?(Hash) ? subject.values.first : subject).class
       klass == Class || klass == Module
     end
 
@@ -91,7 +97,11 @@ module CanCan
     end
 
     def matches_subject_class?(subject)
-      @subjects.any? { |sub| sub.kind_of?(Module) && (subject.kind_of?(sub) || subject.class.to_s == sub.to_s || subject.kind_of?(Module) && subject.ancestors.include?(sub)) }
+      @subjects.any? do |sub|
+        sub.is_a?(Module) && (subject.is_a?(sub) ||
+                                 subject.class.to_s == sub.to_s ||
+                                 (subject.is_a?(Module) && subject.ancestors.include?(sub)))
+      end
     end
 
     # Checks if the given subject matches the given conditions hash.
@@ -99,36 +109,24 @@ module CanCan
     # override_matching_for_conditions?(subject, conditions) and
     # matches_conditions_hash?(subject, conditions)
     def matches_conditions_hash?(subject, conditions = @conditions)
-      if conditions.empty?
-        true
-      else
-        if model_adapter(subject).override_conditions_hash_matching? subject, conditions
-          model_adapter(subject).matches_conditions_hash? subject, conditions
+      return true if conditions.empty?
+      adapter = model_adapter(subject)
+
+      if adapter.override_conditions_hash_matching?(subject, conditions)
+        return adapter.matches_conditions_hash?(subject, conditions)
+      end
+
+      conditions.all? do |name, value|
+        if adapter.override_condition_matching?(subject, name, value)
+          adapter.matches_condition?(subject, name, value)
         else
-          conditions.all? do |name, value|
-            if model_adapter(subject).override_condition_matching? subject, name, value
-              model_adapter(subject).matches_condition? subject, name, value
-            else
-              attribute = subject.send(name)
-              if value.kind_of?(Hash)
-                if attribute.kind_of?(Array) || attribute.kind_of?(ActiveRecord::Relation)
-                  attribute.any? { |element| matches_conditions_hash? element, value }
-                else
-                  !attribute.nil? && matches_conditions_hash?(attribute, value)
-                end
-              elsif !value.is_a?(String) && value.kind_of?(Enumerable)
-                value.include? attribute
-              else
-                attribute == value
-              end
-            end
-          end
+          condition_match?(subject.send(name), value)
         end
       end
     end
 
     def nested_subject_matches_conditions?(subject_hash)
-      parent, child = subject_hash.first
+      parent, _child = subject_hash.first
       matches_conditions_hash?(parent, @conditions[parent.class.name.downcase.to_sym] || {})
     end
 
@@ -142,6 +140,24 @@ module CanCan
 
     def model_adapter(subject)
       CanCan::ModelAdapters::AbstractAdapter.adapter_class(subject_class?(subject) ? subject : subject.class)
+    end
+
+    def condition_match?(attribute, value)
+      case value
+      when Hash       then hash_condition_match?(attribute, value)
+      when String     then attribute == value
+      when Range      then value.cover?(attribute)
+      when Enumerable then value.include?(attribute)
+      else attribute == value
+      end
+    end
+
+    def hash_condition_match?(attribute, value)
+      if attribute.is_a?(Array) || (defined?(ActiveRecord) && attribute.is_a?(ActiveRecord::Relation))
+        attribute.any? { |element| matches_conditions_hash?(element, value) }
+      else
+        attribute && matches_conditions_hash?(attribute, value)
+      end
     end
   end
 end

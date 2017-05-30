@@ -1,5 +1,4 @@
 module CanCan
-
   # This module is designed to be included into an Ability class. This will
   # provide the "can" methods for defining and checking abilities.
   #
@@ -29,6 +28,13 @@ module CanCan
     #
     #   can? :create, @category => Project
     #
+    # You can also pass multiple objects to check. You only need to pass a hash
+    # following the pattern { :any => [many subjects] }. The behaviour is check if
+    # there is a permission on any of the given objects.
+    #
+    #   can? :create, {:any => [Project, Rule]}
+    #
+    #
     # Any additional arguments will be passed into the "can" block definition. This
     # can be used to pass more information about the user's request for example.
     #
@@ -54,9 +60,11 @@ module CanCan
     #
     # Also see the RSpec Matchers to aid in testing.
     def can?(action, subject, *extra_args)
-      match = relevant_rules_for_match(action, subject).detect do |rule|
-        rule.matches_conditions?(action, subject, extra_args)
-      end
+      match = extract_subjects(subject).lazy.map do |a_subject|
+        relevant_rules_for_match(action, a_subject).detect do |rule|
+          rule.matches_conditions?(action, a_subject, extra_args)
+        end
+      end.reject(&:nil?).first
       match ? match.base_behavior : false
     end
 
@@ -108,7 +116,7 @@ module CanCan
     #   can :read, :stats
     #   can? :read, :stats # => true
     #
-    # IMPORTANT: Neither a hash of conditions or a block will be used when checking permission on a class.
+    # IMPORTANT: Neither a hash of conditions nor a block will be used when checking permission on a class.
     #
     #   can :update, Project, :priority => 3
     #   can? :update, Project # => true
@@ -122,7 +130,7 @@ module CanCan
     #   end
     #
     def can(action = nil, subject = nil, conditions = nil, &block)
-      rules << Rule.new(true, action, subject, conditions, block)
+      add_rule(Rule.new(true, action, subject, conditions, block))
     end
 
     # Defines an ability which cannot be done. Accepts the same arguments as "can".
@@ -138,7 +146,7 @@ module CanCan
     #   end
     #
     def cannot(action = nil, subject = nil, conditions = nil, &block)
-      rules << Rule.new(false, action, subject, conditions, block)
+      add_rule(Rule.new(false, action, subject, conditions, block))
     end
 
     # Alias one or more actions into another one.
@@ -179,7 +187,8 @@ module CanCan
 
     # User shouldn't specify targets with names of real actions or it will cause Seg fault
     def validate_target(target)
-      raise Error, "You can't specify target (#{target}) as alias because it is real action name" if aliased_actions.values.flatten.include? target
+      error_message = "You can't specify target (#{target}) as alias because it is real action name"
+      raise Error, error_message if aliased_actions.values.flatten.include? target
     end
 
     # Returns a hash of aliased actions. The key is the target and the value is an array of actions aliasing the key.
@@ -200,7 +209,7 @@ module CanCan
     # See ControllerAdditions#authorize! for documentation.
     def authorize!(action, subject, *args)
       message = nil
-      if args.last.kind_of?(Hash) && args.last.has_key?(:message)
+      if args.last.is_a?(Hash) && args.last.key?(:message)
         message = args.pop[:message]
       end
       if cannot?(action, subject, *args)
@@ -212,9 +221,9 @@ module CanCan
 
     def unauthorized_message(action, subject)
       keys = unauthorized_message_keys(action, subject)
-      variables = {:action => action.to_s}
+      variables = { action: action.to_s }
       variables[:subject] = (subject.class == Class ? subject : subject.class).to_s.underscore.humanize.downcase
-      message = I18n.translate(nil, variables.merge(:scope => :unauthorized, :default => keys + [""]))
+      message = I18n.translate(nil, variables.merge(scope: :unauthorized, default: keys + ['']))
       message.blank? ? nil : message
     end
 
@@ -235,16 +244,53 @@ module CanCan
     end
 
     def merge(ability)
-      ability.send(:rules).each do |rule|
-        rules << rule.dup
+      ability.rules.each do |rule|
+        add_rule(rule.dup)
       end
       self
+    end
+
+    # Return a hash of permissions for the user in the format of:
+    #   {
+    #     can: can_hash,
+    #     cannot: cannot_hash
+    #   }
+    #
+    # Where can_hash and cannot_hash are formatted thusly:
+    #   {
+    #     action: array_of_objects
+    #   }
+    def permissions
+      permissions_list = { can: {}, cannot: {} }
+
+      rules.each do |rule|
+        subjects = rule.subjects
+        expand_actions(rule.actions).each do |action|
+          if rule.base_behavior
+            permissions_list[:can][action] ||= []
+            permissions_list[:can][action] += subjects.map(&:to_s)
+          else
+            permissions_list[:cannot][action] ||= []
+            permissions_list[:cannot][action] += subjects.map(&:to_s)
+          end
+        end
+      end
+
+      permissions_list
+    end
+
+    protected
+
+    # Must be protected as an ability can merge with other abilities.
+    # This means that an ability must expose their rules with another ability.
+    def rules
+      @rules ||= []
     end
 
     private
 
     def unauthorized_message_keys(action, subject)
-      subject = (subject.class == Class ? subject : subject.class).name.underscore unless subject.kind_of? Symbol
+      subject = (subject.class == Class ? subject : subject.class).name.underscore unless subject.is_a? Symbol
       [subject, :all].map do |try_subject|
         [aliases_for_action(action), :manage].flatten.map do |try_action|
           :"#{try_action}.#{try_subject}"
@@ -256,9 +302,29 @@ module CanCan
     # This should be called before "matches?" and other checking methods since they
     # rely on the actions to be expanded.
     def expand_actions(actions)
-      actions.map do |action|
-        aliased_actions[action] ? [action, *expand_actions(aliased_actions[action])] : action
-      end.flatten
+      expanded_actions[actions] ||= begin
+        expanded = []
+        actions.each do |action|
+          expanded << action
+          if (aliases = aliased_actions[action])
+            expanded += expand_actions(aliases)
+          end
+        end
+        expanded
+      end
+    end
+
+    def expanded_actions
+      @expanded_actions ||= {}
+    end
+
+    # It translates to an array the subject or the hash with multiple subjects given to can?.
+    def extract_subjects(subject)
+      if subject.is_a?(Hash) && subject.key?(:any)
+        subject[:any]
+      else
+        [subject]
+      end
     end
 
     # Given an action, it will try to find all of the actions which are aliased to it.
@@ -271,40 +337,86 @@ module CanCan
       results
     end
 
-    def rules
-      @rules ||= []
+    def add_rule(rule)
+      rules << rule
+      add_rule_to_index(rule, rules.size - 1)
+    end
+
+    def add_rule_to_index(rule, position)
+      @rules_index ||= Hash.new { |h, k| h[k] = [] }
+
+      subjects = rule.subjects.compact
+      subjects << :all if subjects.empty?
+
+      subjects.each do |subject|
+        @rules_index[subject] << position
+      end
+    end
+
+    def alternative_subjects(subject)
+      subject = subject.class unless subject.is_a?(Module)
+      [:all, *subject.ancestors,  subject.class.to_s]
     end
 
     # Returns an array of Rule instances which match the action and subject
     # This does not take into consideration any hash conditions or block statements
     def relevant_rules(action, subject)
-      rules.reverse.select do |rule|
+      return [] unless @rules
+      relevant = possible_relevant_rules(subject).select do |rule|
         rule.expanded_actions = expand_actions(rule.actions)
         rule.relevant? action, subject
+      end
+      relevant.reverse!.uniq!
+      optimize_order! relevant
+      relevant
+    end
+
+    # Optimizes the order of the rules, so that rules with the :all subject are evaluated first.
+    def optimize_order!(rules)
+      first_can_in_group = -1
+      rules.each_with_index do |rule, i|
+        (first_can_in_group = -1) && next unless rule.base_behavior
+        (first_can_in_group = i) && next if first_can_in_group == -1
+        next unless rule.subjects == [:all]
+        rules[i] = rules[first_can_in_group]
+        rules[first_can_in_group] = rule
+        first_can_in_group += 1
+      end
+    end
+
+    def possible_relevant_rules(subject)
+      if subject.is_a?(Hash)
+        rules
+      else
+        positions = @rules_index.values_at(subject, *alternative_subjects(subject))
+        positions.flatten!.sort!
+        positions.map { |i| @rules[i] }
       end
     end
 
     def relevant_rules_for_match(action, subject)
       relevant_rules(action, subject).each do |rule|
-        if rule.only_raw_sql?
-          raise Error, "The can? and cannot? call cannot be used with a raw sql 'can' definition. The checking code cannot be determined for #{action.inspect} #{subject.inspect}"
-        end
+        next unless rule.only_raw_sql?
+        raise Error,
+              "The can? and cannot? call cannot be used with a raw sql 'can' definition."\
+              " The checking code cannot be determined for #{action.inspect} #{subject.inspect}"
       end
     end
 
     def relevant_rules_for_query(action, subject)
       relevant_rules(action, subject).each do |rule|
         if rule.only_block?
-          raise Error, "The accessible_by call cannot be used with a block 'can' definition. The SQL cannot be determined for #{action.inspect} #{subject.inspect}"
+          raise Error, "The accessible_by call cannot be used with a block 'can' definition."\
+                       " The SQL cannot be determined for #{action.inspect} #{subject.inspect}"
         end
       end
     end
 
     def default_alias_actions
       {
-        :read => [:index, :show],
-        :create => [:new],
-        :update => [:edit],
+        read: %i[index show],
+        create: [:new],
+        update: [:edit]
       }
     end
   end
