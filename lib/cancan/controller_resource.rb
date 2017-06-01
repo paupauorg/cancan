@@ -257,6 +257,8 @@ module CanCan
         @params[extract_key(@options[:instance_name])]
       elsif @options[:class] && @params.key?(extract_key(@options[:class]))
         @params[extract_key(@options[:class])]
+      elsif @options[:class]
+        @params[extract_key(@options[:class])]
       else
         @params[extract_key(namespaced_name)]
       end
